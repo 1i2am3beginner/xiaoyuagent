@@ -1,0 +1,35 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.whl
+
+# ---- uv 沙箱内缓存（本机 uv 全局缓存无写权限时的退路）----
+.uvcache/
+
+# ---- myagent 运行时目录 ----
+# 建议把项目级运行时目录排除；审计与备份需要留存时请自行调整
+.myagent/
+
+# ---- 测试/脚本临时区 ----
+.tmp/
+.smoke-work/
+.pytest-tmp/
+.tmp-llm-tests/
+.tmp_probe/
+pytest-cache-files-*/
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini

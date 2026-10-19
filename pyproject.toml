@@ -1,0 +1,77 @@
+[project]
+name = "my-agent"
+version = "0.1.0"
+description = "本地运行的编程 CLI Agent：双层 Agent-Loop + 四阶段权限流水线"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "typer>=0.12",
+  "rich>=13.7",
+  "openai>=1.55",
+  "pydantic>=2.7",
+  "PyYAML>=6.0",
+  "pathspec>=0.12",
+  "rapidfuzz>=3.9",
+  "httpx>=0.27",
+  "json-repair>=0.64.0",
+]
+
+[project.scripts]
+myagent = "my_agent.cli:app"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.2",
+  "pytest-asyncio>=0.23",
+  "pytest-httpx>=0.30",
+  "ruff>=0.5",
+]
+extras = ["tiktoken>=0.7"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/my_agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+asyncio_mode = "auto"
+# 临时目录重定向由 tests/conftest.py 在导入期完成（每次会话一个全新目录）。
+# 这里不再设置 --basetemp：已存在的 basetemp 在受管环境下可能被拒绝复用/删除。
+# 禁用 pytest 缓存插件：它会在项目根目录建 pytest-cache-files-* 临时目录，
+# 而本机沙箱 ACL 会让改名/清理失败，每跑一次测试就留下一个空壳目录。
+addopts = "-q -p no:cacheprovider"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RET", "ARG", "PTH"]
+ignore = [
+  "E501",    # 行宽由 formatter 处理
+  "B008",    # Typer/pydantic 依赖注入惯用法
+  "SIM105",  # contextlib.suppress 更啰嗦时允许 try/except pass
+  "SIM108",  # 三元表达式可读性未必更好
+  "SIM117",  # 嵌套 with 有时更清晰
+  "RET504",  # 显式赋值便于调试
+  "C416",    # list(...) 与推导式的取舍
+  "B007",    # 解包占位变量
+  "PTH105",  # §7.4/§7.7 明确要求「临时文件 + os.replace」的原子写语义
+  "PTH109",  # os.getcwd() 在部分调用路径更直观
+  "ARG001",  # 协议实现（DisplayPort/Confirmer/Tool 等）必须保持统一签名
+  "ARG002",  # 同上
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ARG001", "ARG002", "ARG005", "B011"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
