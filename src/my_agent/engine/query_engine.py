@@ -107,6 +107,8 @@ class QueryEngine:
         self.memory_writer: MemoryWriter | None = None
         self.slash: SlashRegistry | None = None
         self.mcp: Any = None
+        self.subagent_runner: Any = None
+        self.dispatch_judge: Any = None
 
         self.system_prompt = ""
         self.repomap = ""
@@ -190,6 +192,8 @@ class QueryEngine:
 
         # 8. 工具注册表 = 内置 + 记忆/skill/归档 + MCP + 子 Agent
         self.tools = await self._build_tools()
+        # 8.5 分发审判器（U35）：必须在 subagent_runner 建好之后，过粗时由它亲自补发
+        self.dispatch_judge = self._build_dispatch_judge()
 
         # 9. 工作目录摘要（命中缓存则直接用）与记忆注入
         self.repomap = await self._load_repomap()
@@ -261,7 +265,9 @@ class QueryEngine:
             extra.append(ArchiveSearchTool(self.archive))
         extra.extend(self._memory_tools())
         if self.config.agents.enabled:
-            extra.append(TaskTool(self._build_subagent_runner(registry)))
+            # 保留引用：内层 Query 需要在每轮模型调用前 drain 后台子 Agent 结论（§12.2）
+            self.subagent_runner = self._build_subagent_runner(registry)
+            extra.append(TaskTool(self.subagent_runner))
         for tool in extra:
             try:
                 registry.register(tool)
@@ -320,6 +326,26 @@ class QueryEngine:
             cwd=self.cwd,
             project_root=self.project_root,
             display=self.console,
+        )
+
+    def _build_dispatch_judge(self) -> Any:
+        """构造任务分发审判器（U35）。多 Agent 或审判开关关闭时返回 ``None``。
+
+        Returns:
+            :class:`~my_agent.agents.dispatch_judge.DispatchJudge` 或 ``None``。
+        """
+        from my_agent.agents.dispatch_judge import DispatchJudge
+        from my_agent.config import defaults as D
+
+        if not self.config.agents.enabled or not D.DISPATCH_JUDGE_ENABLED:
+            return None
+        assert self.llm is not None
+        return DispatchJudge(
+            llm=self.llm,
+            config=self.config,
+            display=self.console,
+            runner=self.subagent_runner,
+            project_root=self.project_root,
         )
 
     async def _register_mcp_tools(self, registry: Any) -> None:
@@ -481,6 +507,8 @@ class QueryEngine:
             repomap=self.repomap,
             memory_block=self.memory_block,
             skills_block=self.skills_block,
+            subagent_runner=self.subagent_runner,
+            dispatch_judge=self.dispatch_judge,
         )
 
     async def _hook_user_input(self, text: str) -> str | None:
@@ -623,6 +651,11 @@ class QueryEngine:
                 _LOG.warning("session_end hook 失败：%s", exc.user_message())
 
         self._persist()
+        if self.subagent_runner is not None:
+            try:
+                await self.subagent_runner.aclose()
+            except MyAgentError as exc:  # pragma: no cover - 退出路径尽力而为
+                _LOG.warning("子 Agent 关闭失败：%s", exc.user_message())
         if self.mcp is not None:
             try:
                 await self.mcp.aclose()

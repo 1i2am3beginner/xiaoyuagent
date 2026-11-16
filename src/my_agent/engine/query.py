@@ -11,11 +11,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from my_agent.config.defaults import (
     CONSECUTIVE_FAILURE_LIMIT,
     EMPTY_RESPONSE_RETRIES,
+    MAX_DISPATCH_JUDGE_PER_TURN,
     MAX_TOOL_CALLS_PER_TURN,
     MAX_TURNS_PER_REQUEST,
 )
@@ -83,6 +85,8 @@ class Query:
         skills_block: str = "",
         subagent_id: str | None = None,
         loop_guard: LoopGuard | None = None,
+        subagent_runner: Any = None,
+        dispatch_judge: Any = None,
     ) -> None:
         """装配内层循环的全部依赖（依赖注入，便于测试）。
 
@@ -104,6 +108,12 @@ class Query:
             subagent_id: 子 Agent 标识（§12，用于审计与提示）。
             loop_guard: 死循环守卫（【待确认假设 U33】）；``None`` = 按配置构造真实守卫，
                 注入点供测试替换（测试不得触网）。
+            subagent_runner: 子 Agent 运行时（§12.2）。给出时，每轮模型调用前会
+                ``drain_background()`` 把已完成的后台子 Agent 结论注入主上下文；
+                ``None`` = 不处理后台结论（子 Agent 内部构造的 Query 即为此情形）。
+            dispatch_judge: 任务分发审判器（【待确认假设 U35】）。给出时，每轮 ``Task``
+                批次执行**之前**先审一遍分发计划：过粗由审判器亲自补发、过细返回补丁
+                让模型重新分发；``None`` = 不审判。
         """
         self.session = session
         self.config = config
@@ -120,6 +130,9 @@ class Query:
         self.memory_block = memory_block
         self.skills_block = skills_block
         self.subagent_id = subagent_id
+        self.subagent_runner = subagent_runner
+        self.dispatch_judge = dispatch_judge
+        self._dispatch_judge_count = 0
         self.loop_guard = loop_guard if loop_guard is not None else self._build_loop_guard()
 
         self.abort_event = asyncio.Event()
@@ -167,6 +180,7 @@ class Query:
         from my_agent.engine.query_engine import EngineResult  # 延迟导入避免循环
 
         self.loop_guard.reset()  # 每个用户回合从零开始（U33）
+        self._dispatch_judge_count = 0  # 分发审判的回合预算（U35）
         self._loop_aborted = False
         self._loop_message = ""
         self.session.turn_index += 1
@@ -205,6 +219,7 @@ class Query:
         failures = 0
         empty_retries = 0
         for attempt in range(MAX_TURNS_PER_REQUEST):
+            self._drain_background(turn)
             messages = await self._assemble(turn)
             await self._hook_before_model(messages)
 
@@ -304,6 +319,39 @@ class Query:
             )
         return text or f"已达单次请求的工具调用上限（{MAX_TURNS_PER_REQUEST} 轮）。"
 
+    # ------------------------------------------------------------------ 后台子 Agent
+    def _drain_background(self, turn: int) -> None:
+        """把已完成的后台子 Agent 结论注入主上下文（§12.2）。
+
+        每次模型调用前调用一次：``SubagentRunner.drain_background()`` 返回尚未投递的
+        ``[后台子 Agent 完成] …`` 结论块，这里以 ``role="user"`` 消息追加进 history，
+        使模型在**本轮**就能看到（这正是「后台并行」的意义）。
+
+        设计要点：
+        - 只在**主 Query** 生效：子 Agent 内部构造的 ``Query`` 不传 ``subagent_runner``，
+          因此深度 1 的隔离不被破坏；
+        - 任何异常都只记日志、不阻断回合——后台结论是**增强信息**，不能反过来弄挂主流程；
+        - 取走即清空（``drain_background`` 语义），不会重复注入。
+
+        Args:
+            turn: 当前轮次（写入消息元数据，供摘要/检索定位）。
+        """
+        runner = self.subagent_runner
+        if runner is None:
+            return
+        try:
+            blocks = runner.drain_background()
+        except Exception as exc:  # 后台结论是增强信息：任何故障都不得阻断主回合
+            _LOG.warning("取回后台子 Agent 结论失败（已忽略）：%s", exc)
+            return
+        for block in blocks:
+            if not block:
+                continue
+            self.session.history.append(
+                Message(role="user", content=block, turn_index=turn, subagent_id=None)
+            )
+            _LOG.info("已注入后台子 Agent 结论（%d 字符）", len(block))
+
     # ------------------------------------------------------------------ 三步
     async def _assemble(self, turn: int) -> list[Message]:
         """组装发往模型的消息（§7.6）。
@@ -343,6 +391,105 @@ class Query:
             timeout_s=None,
         )
 
+    async def _review_dispatch(
+        self, calls: list[ToolCallRequest], turn: int
+    ) -> dict[str, str]:
+        """对整批 ``Task`` 调用做分发审判（U35）。
+
+        两条派生路径（用户明确要求）：
+
+        - **过粗**：审判器**亲自补发**遗漏的子任务，结论以 ``[审判 Agent 补发的…]``
+          的 user 消息注入主上下文；原批次照常执行；
+        - **过细**：审判器**不派生**，把「结论/补丁/影响分析/理由」作为反馈打回，
+          由模型在下一轮用修订后的任务重新分发。
+
+        审判模型不可用时：审判器已按指数退避重试并**告警用户**，此处按放行处理。
+
+        Args:
+            calls: 本轮全部工具调用。
+            turn: 当前轮次。
+
+        Returns:
+            ``call_id -> 打回反馈``；空字典表示不需要打回（放行）。
+        """
+        judge = self.dispatch_judge
+        if judge is None:
+            return {}
+        task_calls = [call for call in calls if call.name == "Task"]
+        if not task_calls:
+            return {}
+        if self._dispatch_judge_count >= MAX_DISPATCH_JUDGE_PER_TURN:
+            _LOG.info("本回合审判次数已达上限（%d），跳过审判", MAX_DISPATCH_JUDGE_PER_TURN)
+            return {}
+        self._dispatch_judge_count += 1
+
+        from my_agent.agents.dispatch_judge import (
+            DispatchVerdict,
+            SubtaskSpec,
+            build_context,
+            supplement_text,
+        )
+
+        subtasks = [
+            SubtaskSpec(
+                description=str(call.arguments.get("description") or "").strip() or "子任务",
+                prompt=str(call.arguments.get("prompt") or "").strip(),
+                agent_type=str(call.arguments.get("agent_type") or "general"),
+            )
+            for call in task_calls
+        ]
+        root = Path(self.session.project_root or self.session.cwd)
+        constraints = (self.memory_block or "")[:2_000]
+        try:
+            context = build_context(
+                user_requirement=self._current_user_requirement(),
+                subtasks=subtasks,
+                constraints=constraints,
+                root=root,
+            )
+            judgment, supplements = await judge.review(context, parent=self.session)
+        except MyAgentError as exc:
+            # 审判失败绝不阻断分发（fail-open）；审判器内部已尝试退避重试并告警
+            _LOG.warning("分发审判失败（放行）：%s", exc.user_message())
+            return {}
+
+        if supplements:
+            block = supplement_text(supplements)
+            if block:
+                self.session.history.append(
+                    Message(role="user", content=block, turn_index=turn)
+                )
+                self.display.info(f"审判 Agent 已补发 {len(supplements)} 个子任务")
+
+        if judgment.verdict is DispatchVerdict.TOO_FINE:
+            feedback = judgment.feedback_text()
+            self.display.warn(f"审判 Agent 判定分发过细：{judgment.reason}")
+            return {call.id: feedback for call in task_calls}
+
+        if judgment.verdict is DispatchVerdict.TOO_COARSE:
+            _LOG.info("审判判定分发过粗：%s", judgment.reason)
+
+        return {}
+
+    def _current_user_requirement(self) -> str:
+        """取「原始用户需求」——最近一条真实用户输入（排除注入块）。
+
+        Returns:
+            用户输入文本；找不到时返回空串。
+        """
+        skip_prefixes = (
+            "[后台子 Agent 完成]",
+            "[审判 Agent 补发的子任务结论]",
+        )
+        for message in reversed(self.session.history):
+            if message.role != "user" or message.kind != "normal":
+                continue
+            content = (message.content or "").strip()
+            if not content or content.startswith(skip_prefixes):
+                continue
+            return content
+        return ""
+
     async def _step_act(self, calls: list[ToolCallRequest], turn: int) -> list[ToolResult]:
         """对每个 call 走权限流水线并执行（§5.3.4 B3/B4/B5/B6）。
 
@@ -362,9 +509,22 @@ class Query:
         )
         self.session.history.append(assistant_msg)
 
+        # 分发审判（U35）：整批 Task 在执行前先审一遍。返回值 = 需要打回的 call_id → 反馈
+        rejected = await self._review_dispatch(calls, turn)
+
         plans: list[PermissionDecision | ToolResult] = []
 
         for call in calls:
+            if call.id in rejected:
+                plans.append(
+                    ToolResult(
+                        call_id=call.id,
+                        tool=call.name,
+                        ok=False,
+                        error=rejected[call.id],
+                    )
+                )
+                continue
             spec = self.tools.get_spec(call.name)
             if spec is None:
                 plans.append(

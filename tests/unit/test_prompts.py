@@ -20,6 +20,7 @@ from my_agent.llm.prompts import (
     AUDIT_TARGET_DELIMITER,
     AUDIT_TARGET_NEUTRALIZED,
     COMPACTOR_PROMPT,
+    DISPATCH_JUDGE_PROMPT,
     JUDGE_SYSTEM_PROMPT,
     JUDGE_USER_TEMPLATE,
     MAIN_SYSTEM_PROMPT,
@@ -40,7 +41,8 @@ from my_agent.llm.prompts import (
     template_fields,
 )
 
-#: §13.2 冻结角色名（顺序 = 表格顺序）。
+#: 冻结角色名（顺序 = 表格顺序）。§13.2 的 10 个 + 本次新增的 ``dispatch_judge``
+#: （任务分发审判，U35）。新增角色必须同时更新本元组与 ``_FROZEN_ROLE_BINDINGS``。
 _FROZEN_ROLES: tuple[str, ...] = (
     "main",
     "judge",
@@ -52,6 +54,7 @@ _FROZEN_ROLES: tuple[str, ...] = (
     "repomap",
     "router_gen",
     "subagent",
+    "dispatch_judge",
 )
 
 #: 角色名 → 期望绑定的 system prompt 常量（防止接错线）。
@@ -66,6 +69,7 @@ _FROZEN_ROLE_BINDINGS: dict[str, str] = {
     "repomap": REPOMAP_PROMPT,
     "router_gen": ROUTER_GEN_PROMPT,
     "subagent": SUBAGENT_SYSTEM_PROMPT,
+    "dispatch_judge": DISPATCH_JUDGE_PROMPT,
 }
 
 #: 附录 B 全部占位符（36 个，独立登记，用于双向比对）。
@@ -162,10 +166,10 @@ _JUDGE_KWARGS: dict[str, str] = {
 # --------------------------------------------------------------------------------------
 
 
-def test_role_prompts_has_exactly_the_ten_frozen_keys() -> None:
-    """ROLE_PROMPTS 的键集合与顺序必须与 §13.2 冻结角色表完全一致。"""
+def test_role_prompts_has_exactly_the_frozen_keys() -> None:
+    """ROLE_PROMPTS 的键集合与顺序必须与冻结角色表完全一致（§13.2 的 10 个 + 审判 1 个）。"""
     assert set(ROLE_PROMPTS) == set(_FROZEN_ROLES)
-    assert len(ROLE_PROMPTS) == 10
+    assert len(ROLE_PROMPTS) == len(_FROZEN_ROLES)
     assert tuple(ROLE_PROMPTS) == _FROZEN_ROLES
     assert ROLE_NAMES == _FROZEN_ROLES
 
@@ -177,15 +181,15 @@ def test_role_prompts_are_bound_to_the_right_constants() -> None:
 
 
 # --------------------------------------------------------------------------------------
-# (a) 10 个角色提示词互不相同
+# (a) 全部角色提示词互不相同
 # --------------------------------------------------------------------------------------
 
 
 def test_role_prompts_are_mutually_distinct() -> None:
-    """10 个角色提示词两两不同（§13.2：角色提示词是唯一区分手段）。"""
+    """所有角色提示词两两不同（§13.2：角色提示词是唯一区分手段）。"""
     values = list(ROLE_PROMPTS.values())
-    assert len(values) == 10
-    assert len(set(values)) == 10
+    assert len(values) == len(_FROZEN_ROLES)
+    assert len(set(values)) == len(_FROZEN_ROLES)
     for role, text in ROLE_PROMPTS.items():
         assert text, role
         assert text == text.strip(), role

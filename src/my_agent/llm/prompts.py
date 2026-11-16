@@ -48,6 +48,8 @@ __all__ = [
     "AUDIT_TARGET_DELIMITER",
     "AUDIT_TARGET_NEUTRALIZED",
     "COMPACTOR_PROMPT",
+    "DISPATCH_JUDGE_PROMPT",
+    "DISPATCH_JUDGE_USER_TEMPLATE",
     "JUDGE_SYSTEM_PROMPT",
     "JUDGE_USER_TEMPLATE",
     "MAIN_SYSTEM_PROMPT",
@@ -329,6 +331,59 @@ SUBAGENT_SYSTEM_PROMPT: str = """你是 myagent 的子 Agent，被主 Agent 派�
 
 
 # --------------------------------------------------------------------------------------
+# 角色 ``dispatch_judge``：任务分发审判（§12 扩展）
+# 调用点：``agents/dispatch_judge.py::DispatchJudge.review()``
+# --------------------------------------------------------------------------------------
+DISPATCH_JUDGE_PROMPT: str = """你是任务分发审判器，运行在一个本地编程 Agent 中。
+主 Agent 打算把一个用户需求拆成若干子任务，分别交给子 Agent 执行。你的唯一职责是判断
+**这份分发计划是否合理**，并在不合理时给出可执行的处理方案。
+
+你要判的三件事：
+1. 覆盖性：这些子任务合起来能否**完整**满足用户的原始需求？有没有关键工作没人做？
+2. 粒度：是否存在两个子任务本质上在做同一件事（应合并）？是否存在一个子任务里塞了
+   多个互不相关的工作、导致它必然做不完整（应拆分）？
+3. 自包含性：每个子任务的说明是否足以让子 Agent 独立完成（子 Agent 看不到主对话历史）？
+
+判定规则：
+- 覆盖完整、粒度合适、说明自包含 → verdict = "reasonable"，不要吹毛求疵。
+- **遗漏了必要工作**（少发了任务）→ verdict = "too_coarse"，并在 missing_tasks 中给出
+  应当**补发**的子任务（每个都要自包含）。
+- **拆得过碎/重复/该合并**（发多了或分得太细）→ verdict = "too_fine"，并给出：
+  merged_into（应合并为几个任务）、patch（修订后的任务列表，直接可执行）、
+  impact（涉及的文件/模块路径）、以及一句话理由。
+- 拿不准时倾向 "reasonable"：**误判会让主 Agent 反复重发，代价高于放过**。
+
+证据规则：
+- 只能依据给你的信息与文件摘录判断；**不要臆造**你没看到的内容。
+- 需要更多证据时，在需要的文件里说明；不要假装读过。
+
+输出要求：只输出一个 JSON 对象，不要任何其它文字或代码块标记：
+{"verdict":"reasonable|too_coarse|too_fine",
+ "confidence":"high|medium|low",
+ "reason":"<一句话，<=200字>",
+ "missing_tasks":[{"description":"<3-5词>","prompt":"<自包含任务说明>","agent_type":"general|explore|review"}],
+ "merged_into":<整数或 null>,
+ "patch":[{"description":"<3-5词>","prompt":"<自包含任务说明>","agent_type":"general|explore|review"}],
+ "impact":["<文件或模块路径>"]}"""
+
+#: 审判用户消息模板（最小信息集，**不含完整会话历史**）。
+DISPATCH_JUDGE_USER_TEMPLATE: str = """【原始用户需求】
+{user_requirement}
+
+【拟分发的子任务（共 {subtask_count} 个）】
+{subtasks}
+
+【已知约束 / 验收标准】
+{constraints}
+
+【相关文件路径清单（未附内容；如需内容请依据文件摘录）】
+{file_paths}
+
+【文件摘录（由审判器自行读取，主 Agent 未见其内容）】
+{file_excerpts}"""
+
+
+# --------------------------------------------------------------------------------------
 # 角色表与默认生成参数（§13.2 / §13.4）
 # --------------------------------------------------------------------------------------
 
@@ -344,6 +399,7 @@ ROLE_NAMES: tuple[str, ...] = (
     "repomap",
     "router_gen",
     "subagent",
+    "dispatch_judge",
 )
 
 #: 角色名 → system prompt（§13.2「唯一区分手段」）。
@@ -358,6 +414,7 @@ ROLE_PROMPTS: dict[str, str] = {
     "repomap": REPOMAP_PROMPT,
     "router_gen": ROUTER_GEN_PROMPT,
     "subagent": SUBAGENT_SYSTEM_PROMPT,
+    "dispatch_judge": DISPATCH_JUDGE_PROMPT,
 }
 
 #: 小任务角色（judge/压缩/记忆/skills）的 ``max_tokens`` 上限。
@@ -382,6 +439,8 @@ ROLE_DEFAULTS: dict[str, dict[str, float | int]] = {
     "router_gen": {"temperature": JUDGE_TEMPERATURE, "max_tokens": SMALL_TASK_MAX_TOKENS},
     # 子 Agent 是完整的 ReAct 循环（含工具调用），按主对话档处理（§12.1 / §13.3）。
     "subagent": {"temperature": MAIN_TEMPERATURE, "max_tokens": MAX_OUTPUT_TOKENS_DEFAULT},
+    # 分发审判需读较长上下文、输出结构化计划，但仍是判定类任务（确定性优先）。
+    "dispatch_judge": {"temperature": JUDGE_TEMPERATURE, "max_tokens": SMALL_TASK_MAX_TOKENS},
 }
 
 

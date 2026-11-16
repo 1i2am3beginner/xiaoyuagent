@@ -20,6 +20,13 @@ __all__ = [
     "COMPRESS_TRIGGER_RATIO",
     "CONSECUTIVE_FAILURE_LIMIT",
     "DEDUPE_THRESHOLD",
+    "DISPATCH_JUDGE_BACKOFF_S",
+    "DISPATCH_JUDGE_ENABLED",
+    "DISPATCH_JUDGE_FILE_EXCERPT_CHARS",
+    "DISPATCH_JUDGE_MAX_FILES",
+    "DISPATCH_JUDGE_MAX_OUTPUT_CHARS",
+    "DISPATCH_JUDGE_MAX_RETRIES",
+    "DISPATCH_JUDGE_TIMEOUT_S",
     "EMPTY_RESPONSE_RETRIES",
     "GRAPH_EDGE_DECAY_PER_DAY",
     "GRAPH_EDGE_MIN",
@@ -42,6 +49,7 @@ __all__ = [
     "LOOP_GUARD_WINDOW",
     "LOOP_REPEAT_THRESHOLD",
     "LOOP_RESULT_SIMILARITY",
+    "MAX_DISPATCH_JUDGE_PER_TURN",
     "MAIN_TEMPERATURE",
     "MAX_CONCURRENT_SUBAGENTS",
     "MAX_CONCURRENT_TOOLS",
@@ -327,6 +335,38 @@ SESSION_KEEP_RECENT = 50
 
 
 # ============================================================================
+# 任务分发审判 Agent（新增：判断子任务分发是否过粗/过细）
+# ============================================================================
+DISPATCH_JUDGE_ENABLED = True
+"""是否启用「任务分发审判」——在 ``Task`` 批次真正执行前先审一遍分发计划。"""
+
+DISPATCH_JUDGE_TIMEOUT_S = 20.0
+"""审判调用的单次超时。判决质量比权限判定更需要上下文，因此比 4s 宽松。"""
+
+DISPATCH_JUDGE_MAX_RETRIES = 3
+"""审判模型失败时的重试次数（**指数退避**，见下）。"""
+
+DISPATCH_JUDGE_BACKOFF_S: tuple[float, ...] = (1.0, 2.0, 4.0)
+"""审判重试的指数退避秒数：1s → 2s → 4s（用户明确要求「指数递增」）。
+
+重试耗尽后**不做任何处理（放行）**，并向用户告警「审判模型故障」——
+即 fail-open，且必须显式告知用户（不静默失效）。
+"""
+
+DISPATCH_JUDGE_MAX_FILES = 6
+"""审判 Agent 自行读取的文件数量上限（主 Agent 只传路径清单，不传内容）。"""
+
+DISPATCH_JUDGE_FILE_EXCERPT_CHARS = 2_000
+"""每个文件交给审判 Agent 的最大字符数（截断，避免审判上下文爆掉）。"""
+
+DISPATCH_JUDGE_MAX_OUTPUT_CHARS = 1_200
+"""单个子任务描述在审判提示词里的最大字符数（防止 prompt 过长）。"""
+
+MAX_DISPATCH_JUDGE_PER_TURN = 1
+"""单回合最多审判几次——防止「过细 → 重发 → 再审 → 再过细」的无限循环。"""
+
+
+# ============================================================================
 # 工具调用健壮性（新增：参数容错解析 / 死循环检测 / 工具层网络退避）
 # ============================================================================
 TOOL_ARG_REPAIR_ENABLED = True
@@ -381,7 +421,10 @@ PENDING_ASSUMPTIONS: dict[str, str] = {
     "U14": "「模型不可用」包含超时/连接失败/5xx/429/401-403/解析失败超限，统一收敛到 ModelUnavailableError",
     "U15": "acceptEdits 快速通道覆盖新建与编辑，不覆盖删除（= Q4）",
     "U33": "死循环判定 = 同(tool,参数)指纹重复 ≥3 次 **且** 结果内容相似度 ≥0.95（阈值待确认）",
-    "U34": "工具层网络异常（WebFetch/WebSearch/MCP HTTP）同样退避重试 3 次；MCP 超时按 §10.5 不重试",    "U16": "兼容只读读取 CLAUDE.md / MYAGENT.md（memory.read_external=true），永不写入这些文件",
+    "U35": (
+        "任务分发审判：过粗→审判 agent 亲自补发（第二条派生路径）；过细→返回补丁由主 agent 重发；"
+        "审判模型失败→指数退避重试后**放行并告警用户**（fail-open，不静默失效）"
+    ),    "U34": "工具层网络异常（WebFetch/WebSearch/MCP HTTP）同样退避重试 3 次；MCP 超时按 §10.5 不重试",    "U16": "兼容只读读取 CLAUDE.md / MYAGENT.md（memory.read_external=true），永不写入这些文件",
     # ---- §20.3 工程补充项 ----
     "U17": "做写前备份 + /undo（无沙盒 + 无备份 = 误改不可恢复）",
     "U18": "大结果落盘文件会话级保留，超 200MB 淘汰最旧",
